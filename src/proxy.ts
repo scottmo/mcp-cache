@@ -29,6 +29,7 @@ export class MCPProxy {
   private targetLastError?: string;
   private targetServerInfo?: { name?: string; version?: string };
   private connectInterval?: ReturnType<typeof setInterval>;
+  private effectiveAsyncTarget = false;
 
   constructor(private targetCommand: string, private targetArgs: string[]) {
     this.server = new Server(
@@ -61,8 +62,7 @@ export class MCPProxy {
 
     // Handle tool listing
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      const asyncTarget = this.configManager.isAsyncTarget();
-      if (!asyncTarget && this.targetTools.length === 0) {
+      if (!this.effectiveAsyncTarget && this.targetTools.length === 0) {
         try {
           const result = await this.targetTransport.sendRequest('tools/list');
           this.targetTools = result.tools || [];
@@ -441,9 +441,8 @@ export class MCPProxy {
   private async forwardToolCall(toolName: string, args: any): Promise<any> {
     const maxTokens = this.configManager.getMaxTokens();
     const alwaysCacheAndReturn = maxTokens === 0;
-    const asyncTarget = this.configManager.isAsyncTarget();
 
-    if (asyncTarget && this.targetStatus !== 'online') {
+    if (this.effectiveAsyncTarget && this.targetStatus !== 'online') {
       if (alwaysCacheAndReturn) {
         const argsKey = stableArgsKey(args ?? {});
         const cached = await this.cacheManager.getByToolAndArgs(toolName, argsKey);
@@ -558,16 +557,17 @@ export class MCPProxy {
   async start(): Promise<void> {
     await this.targetTransport.start();
 
-    const asyncTarget = this.configManager.isAsyncTarget();
+    const asyncTargetRequested = this.configManager.isAsyncTarget();
+    const cached = asyncTargetRequested ? await this.cacheManager.getTargetInterface() : null;
+    const hasTargetInterfaceCache = (cached?.tools?.length ?? 0) > 0;
 
-    if (asyncTarget) {
+    // only use async connection if we have a cached target interface, otherwise we would not
+    // have the right tools to display to the client.
+    if (asyncTargetRequested && hasTargetInterfaceCache) {
+      this.effectiveAsyncTarget = true;
       this.targetStatus = 'connecting';
-      const cached = await this.cacheManager.getTargetInterface();
-      if (cached?.tools?.length) {
-        this.targetTools = cached.tools as Tool[];
-        if (cached.serverInfo) this.targetServerInfo = cached.serverInfo;
-      }
-      // Connect our server to stdio immediately so client can use cache tools and target_status
+      this.targetTools = cached!.tools as Tool[];
+      if (cached!.serverInfo) this.targetServerInfo = cached!.serverInfo;
       const transport = new StdioServerTransport();
       await this.server.connect(transport);
       this.startBackgroundConnect();
@@ -617,7 +617,7 @@ export class MCPProxy {
     this.configManager = new ConfigManager(this.clientInfo);
     const config = this.configManager.getConfig();
     this.cacheManager = new CacheManager(config.cacheDir, config.ttl);
-    if (!asyncTarget) {
+    if (!this.effectiveAsyncTarget) {
       console.error(`Client: ${this.clientInfo.name} (Token limit: ${this.configManager.getMaxTokens()})`);
     }
   }
