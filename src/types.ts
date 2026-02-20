@@ -15,6 +15,8 @@ export interface StreamConfig {
   enableIndexing: boolean;
   compression: boolean;
   debug: boolean;
+  /** If true, proxy becomes active immediately; target MCP is connected in background. */
+  asyncTarget: boolean;
 }
 
 export interface CachedResponse {
@@ -32,6 +34,7 @@ export interface CachedResponse {
 export interface ResponseMetadata {
   id: string;
   tool: string;
+  argsKey?: string;
   sizeBytes: number;
   createdAt: string;
   expiresAt: string;
@@ -63,5 +66,6 @@ export const DEFAULT_CONFIG: StreamConfig = {
   cacheDir: '~/.mcp-cache/cache',
   enableIndexing: true,
   compression: true,
-  debug: false
+  debug: false,
+  asyncTarget: false,
 };

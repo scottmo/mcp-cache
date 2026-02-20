@@ -9,11 +9,13 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { CacheManager } from './cache.js';
+import { CacheManager, stableArgsKey } from './cache.js';
 import { QueryEngine } from './query.js';
 import { ConfigManager } from './config.js';
 import { TargetServerTransport } from './transport.js';
 import { ClientInfo } from './types.js';
+
+export type TargetStatus = 'offline' | 'connecting' | 'online' | 'error';
 
 export class MCPProxy {
   private server: Server;
@@ -23,6 +25,10 @@ export class MCPProxy {
   private configManager: ConfigManager;
   private clientInfo?: ClientInfo;
   private targetTools: Tool[] = [];
+  private targetStatus: TargetStatus = 'offline';
+  private targetLastError?: string;
+  private targetServerInfo?: { name?: string; version?: string };
+  private connectInterval?: ReturnType<typeof setInterval>;
 
   constructor(private targetCommand: string, private targetArgs: string[]) {
     this.server = new Server(
@@ -55,8 +61,8 @@ export class MCPProxy {
 
     // Handle tool listing
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      // Get tools from target server
-      if (this.targetTools.length === 0) {
+      const asyncTarget = this.configManager.isAsyncTarget();
+      if (!asyncTarget && this.targetTools.length === 0) {
         try {
           const result = await this.targetTransport.sendRequest('tools/list');
           this.targetTools = result.tools || [];
@@ -64,8 +70,9 @@ export class MCPProxy {
           console.error('Failed to get tools from target server:', error);
         }
       }
-
-      // Return management tools + target server tools
+      if (asyncTarget && this.targetStatus !== 'online') {
+        return { tools: this.getManagementTools() };
+      }
       const managementTools = this.getManagementTools();
       return {
         tools: [...this.targetTools, ...managementTools],
@@ -191,6 +198,14 @@ export class MCPProxy {
           required: ['response_id'],
         },
       },
+      {
+        name: 'target_status',
+        description: 'Check whether the proxied MCP server is connected and ready. Use when async mode is enabled (MCP_CACHE_ASYNC_TARGET=true).',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
     ];
   }
 
@@ -202,7 +217,38 @@ export class MCPProxy {
       'get_response_info',
       'refresh_response',
       'delete_response',
+      'target_status',
     ].includes(toolName);
+  }
+
+  private async tryConnectTarget(): Promise<void> {
+    try {
+      const initResult = await this.targetTransport.sendRequest('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'mcp-cache', version: '0.1.0' },
+      });
+      await this.targetTransport.sendNotification('notifications/initialized');
+      this.targetStatus = 'online';
+      this.targetLastError = undefined;
+      this.targetServerInfo = initResult.serverInfo;
+      const listResult = await this.targetTransport.sendRequest('tools/list');
+      this.targetTools = listResult.tools || [];
+      if (this.connectInterval) {
+        clearInterval(this.connectInterval);
+        this.connectInterval = undefined;
+      }
+      console.error('mcp-cache: Target server connected');
+    } catch (error) {
+      this.targetStatus = 'error';
+      this.targetLastError = (error as Error).message;
+    }
+  }
+
+  private startBackgroundConnect(): void {
+    const INTERVAL_MS = 5000;
+    this.connectInterval = setInterval(() => this.tryConnectTarget(), INTERVAL_MS);
+    this.tryConnectTarget();
   }
 
   private async handleManagementTool(toolName: string, args: any): Promise<any> {
@@ -220,6 +266,8 @@ export class MCPProxy {
           return await this.handleRefreshResponse(args);
         case 'delete_response':
           return await this.handleDeleteResponse(args);
+        case 'target_status':
+          return await this.handleTargetStatus();
         default:
           throw new Error(`Unknown management tool: ${toolName}`);
       }
@@ -363,8 +411,46 @@ export class MCPProxy {
     };
   }
 
+  private async handleTargetStatus(): Promise<any> {
+    const payload = {
+      status: this.targetStatus,
+      ...(this.targetLastError && { lastError: this.targetLastError }),
+      ...(this.targetServerInfo && { serverInfo: this.targetServerInfo }),
+    };
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }],
+    };
+  }
+
   private async forwardToolCall(toolName: string, args: any): Promise<any> {
+    const maxTokens = this.configManager.getMaxTokens();
+    const alwaysCacheAndReturn = maxTokens === 0;
+    const asyncTarget = this.configManager.isAsyncTarget();
+
+    if (asyncTarget && this.targetStatus !== 'online') {
+      if (alwaysCacheAndReturn) {
+        const argsKey = stableArgsKey(args ?? {});
+        const cached = await this.cacheManager.getByToolAndArgs(toolName, argsKey);
+        if (cached != null) return cached;
+      }
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'No cached response and proxied MCP is not available. Use target_status to check when it is ready.',
+          },
+        ],
+        isError: true,
+      };
+    }
+
     try {
+      if (alwaysCacheAndReturn) {
+        const argsKey = stableArgsKey(args ?? {});
+        const cached = await this.cacheManager.getByToolAndArgs(toolName, argsKey);
+        if (cached != null) return cached;
+      }
+
       // Forward to target server
       const response = await this.targetTransport.sendRequest('tools/call', {
         name: toolName,
@@ -374,16 +460,20 @@ export class MCPProxy {
       // Check response size with multiple thresholds
       const responseSize = JSON.stringify(response).length;
       const MCP_SDK_LIMIT = 900000; // 900KB - stay under 1MB SDK limit
-      const tokenLimit = this.configManager.getMaxTokens() * 4; // rough token to byte conversion
+      const tokenLimit = maxTokens * 4; // rough token to byte conversion
       const maxSize = Math.min(MCP_SDK_LIMIT, tokenLimit);
 
-      if (responseSize > maxSize) {
-        // Save to cache
+      if (responseSize > maxSize || alwaysCacheAndReturn) {
         const responseId = await this.cacheManager.save(
           toolName,
           response,
-          this.clientInfo?.name || 'unknown'
+          this.clientInfo?.name || 'unknown',
+          alwaysCacheAndReturn ? (args ?? {}) : undefined
         );
+
+        if (alwaysCacheAndReturn) {
+          return response;
+        }
 
         const metadata = await this.cacheManager.getMetadata(responseId);
         const sizeKB = (responseSize / 1024).toFixed(2);
@@ -405,6 +495,8 @@ export class MCPProxy {
       return response;
     } catch (error) {
       const errorMsg = (error as Error).message;
+      this.targetStatus = 'error';
+      this.targetLastError = errorMsg;
 
       // If it's a size error, try to provide helpful message
       if (errorMsg.includes('maximum length') || errorMsg.includes('exceeds')) {
@@ -436,6 +528,10 @@ export class MCPProxy {
 
   private async cleanup(): Promise<void> {
     try {
+      if (this.connectInterval) {
+        clearInterval(this.connectInterval);
+        this.connectInterval = undefined;
+      }
       await this.targetTransport.stop();
       this.cacheManager.stop();
     } catch (error) {
@@ -444,27 +540,35 @@ export class MCPProxy {
   }
 
   async start(): Promise<void> {
-    // Start target server
     await this.targetTransport.start();
 
-    // Initialize target server
-    const initResult = await this.targetTransport.sendRequest('initialize', {
-      protocolVersion: '2024-11-05',
-      capabilities: {},
-      clientInfo: {
-        name: 'mcp-cache',
-        version: '0.1.0',
-      },
-    });
+    const asyncTarget = this.configManager.isAsyncTarget();
 
-    // Send initialized notification
-    await this.targetTransport.sendNotification('notifications/initialized');
+    if (asyncTarget) {
+      this.targetStatus = 'connecting';
+      // Connect our server to stdio immediately so client can use cache tools and target_status
+      const transport = new StdioServerTransport();
+      await this.server.connect(transport);
+      this.startBackgroundConnect();
+      console.error('mcp-cache: Proxy started (async target). Proxied MCP will connect in background.');
+    } else {
+      const initResult = await this.targetTransport.sendRequest('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'mcp-cache', version: '0.1.0' },
+      });
+      await this.targetTransport.sendNotification('notifications/initialized');
+      this.targetStatus = 'online';
+      this.targetServerInfo = initResult.serverInfo;
+      const listResult = await this.targetTransport.sendRequest('tools/list');
+      this.targetTools = listResult.tools || [];
 
-    // Connect our server to stdio
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
+      const transport = new StdioServerTransport();
+      await this.server.connect(transport);
+      console.error('mcp-cache: Proxy started and connected to target server');
+      console.error(`Target server: ${initResult.serverInfo?.name} v${initResult.serverInfo?.version}`);
+    }
 
-    // Handle process signals for graceful shutdown
     process.on('SIGINT', async () => {
       console.error('mcp-cache: Received SIGINT, shutting down...');
       await this.cleanup();
@@ -477,7 +581,6 @@ export class MCPProxy {
       process.exit(0);
     });
 
-    // Handle uncaught errors to prevent crashes
     process.on('uncaughtException', (error) => {
       if ((error as any).code === 'EPIPE') {
         console.error('mcp-cache: Client pipe closed');
@@ -488,18 +591,12 @@ export class MCPProxy {
       }
     });
 
-    // The MCP SDK handles initialization automatically
-    // We'll extract client info from the first tool call
-    // For now, use a default client name
     this.clientInfo = { name: 'claude-ai', version: '0.1.0' };
-
-    // Update config with client info
     this.configManager = new ConfigManager(this.clientInfo);
     const config = this.configManager.getConfig();
     this.cacheManager = new CacheManager(config.cacheDir, config.ttl);
-
-    console.error('mcp-cache: Proxy started and connected to target server');
-    console.error(`Target server: ${initResult.serverInfo?.name} v${initResult.serverInfo?.version}`);
-    console.error(`Client: ${this.clientInfo.name} (Token limit: ${this.configManager.getMaxTokens()})`);
+    if (!asyncTarget) {
+      console.error(`Client: ${this.clientInfo.name} (Token limit: ${this.configManager.getMaxTokens()})`);
+    }
   }
 }

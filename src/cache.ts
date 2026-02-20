@@ -7,6 +7,17 @@ import { join } from 'path';
 import { randomBytes } from 'crypto';
 import { CachedResponse, ResponseMetadata } from './types.js';
 
+/** Stable JSON key for tool args (sorted keys) for cache lookup. */
+export function stableArgsKey(args: Record<string, unknown> | undefined): string {
+  if (args == null || typeof args !== 'object') return '{}';
+  const sorted: Record<string, unknown> = {};
+  for (const k of Object.keys(args).sort()) {
+    const v = args[k];
+    sorted[k] = v && typeof v === 'object' && !Array.isArray(v) ? stableArgsKey(v as Record<string, unknown>) : v;
+  }
+  return JSON.stringify(sorted);
+}
+
 export class CacheManager {
   private cacheDir: string;
   private ttl: number; // seconds
@@ -62,10 +73,11 @@ export class CacheManager {
     return join(this.cacheDir, `${id}.meta.json`);
   }
 
-  async save(tool: string, data: any, client: string): Promise<string> {
+  async save(tool: string, data: any, client: string, args?: Record<string, unknown>): Promise<string> {
     const id = this.generateId();
     const now = new Date();
     const expiresAt = new Date(now.getTime() + this.ttl * 1000);
+    const argsKey = args !== undefined ? stableArgsKey(args) : undefined;
 
     const dataStr = JSON.stringify(data);
     const sizeBytes = Buffer.byteLength(dataStr, 'utf8');
@@ -85,6 +97,7 @@ export class CacheManager {
     const metadata: ResponseMetadata = {
       id,
       tool,
+      ...(argsKey !== undefined && { argsKey }),
       sizeBytes,
       createdAt: cached.createdAt,
       expiresAt: cached.expiresAt,
@@ -121,6 +134,14 @@ export class CacheManager {
     } catch (error) {
       return null;
     }
+  }
+
+  /** Find cached response by tool name and args key (when maxTokens===0). Returns response data or null. */
+  async getByToolAndArgs(toolName: string, argsKey: string): Promise<any | null> {
+    const items = await this.list();
+    const meta = items.find(m => m.tool === toolName && m.argsKey === argsKey);
+    if (!meta || new Date(meta.expiresAt) < new Date()) return null;
+    return this.get(meta.id);
   }
 
   async getMetadata(id: string): Promise<ResponseMetadata | null> {

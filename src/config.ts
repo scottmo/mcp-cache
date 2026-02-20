@@ -44,6 +44,9 @@ export class ConfigManager {
     if (process.env.MCP_CACHE_DEBUG !== undefined) {
       config.debug = process.env.MCP_CACHE_DEBUG === 'true';
     }
+    if (process.env.MCP_CACHE_ASYNC_TARGET !== undefined) {
+      config.asyncTarget = process.env.MCP_CACHE_ASYNC_TARGET === 'true';
+    }
 
     // 3. Expand home directory
     if (config.cacheDir.startsWith('~')) {
@@ -79,5 +82,9 @@ export class ConfigManager {
 
   isDebug(): boolean {
     return this.config.debug;
+  }
+
+  isAsyncTarget(): boolean {
+    return this.config.asyncTarget;
   }
 }

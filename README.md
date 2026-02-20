@@ -202,6 +202,7 @@ MCP_CACHE_CACHE_DIR=~/.mcp-cache/cache  # Cache location
 MCP_CACHE_TTL=3600                      # TTL in seconds (1 hour)
 
 # Features
+MCP_CACHE_ASYNC_TARGET=false     # If true, proxy is active immediately; target MCP connects in background (use target_status tool to check)
 MCP_CACHE_ENABLE_INDEXING=true   # Enable full-text indexing
 MCP_CACHE_COMPRESSION=true       # Compress cached responses
 
