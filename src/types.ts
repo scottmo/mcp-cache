@@ -43,6 +43,13 @@ export interface ResponseMetadata {
   indexed: boolean;
 }
 
+/** Cached copy of the proxied MCP's tools list (and optional serverInfo) for display when target is offline (async mode). */
+export interface CachedTargetInterface {
+  tools: Array<{ name: string; description?: string; inputSchema?: object }>;
+  serverInfo?: { name?: string; version?: string };
+  savedAt: string;
+}
+
 export interface QueryOptions {
   mode?: 'text' | 'jsonpath' | 'regex';
   limit?: number;

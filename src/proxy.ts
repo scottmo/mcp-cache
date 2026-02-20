@@ -70,9 +70,6 @@ export class MCPProxy {
           console.error('Failed to get tools from target server:', error);
         }
       }
-      if (asyncTarget && this.targetStatus !== 'online') {
-        return { tools: this.getManagementTools() };
-      }
       const managementTools = this.getManagementTools();
       return {
         tools: [...this.targetTools, ...managementTools],
@@ -94,6 +91,18 @@ export class MCPProxy {
   }
 
   private getManagementTools(): Tool[] {
+    if (this.configManager.getMaxTokens() === 0) {
+      return [
+        {
+          name: 'target_status',
+          description: 'Check whether the proxied MCP server is connected and ready. Use when async mode is enabled (MCP_CACHE_ASYNC_TARGET=true).',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+      ];
+    }
     return [
       {
         name: 'query_response',
@@ -234,6 +243,7 @@ export class MCPProxy {
       this.targetServerInfo = initResult.serverInfo;
       const listResult = await this.targetTransport.sendRequest('tools/list');
       this.targetTools = listResult.tools || [];
+      await this.cacheManager.saveTargetInterface(this.targetTools, this.targetServerInfo);
       if (this.connectInterval) {
         clearInterval(this.connectInterval);
         this.connectInterval = undefined;
@@ -252,6 +262,12 @@ export class MCPProxy {
   }
 
   private async handleManagementTool(toolName: string, args: any): Promise<any> {
+    if (this.configManager.getMaxTokens() === 0 && toolName !== 'target_status') {
+      return {
+        content: [{ type: 'text' as const, text: `Tool ${toolName} is disabled when MCP_CACHE_MAX_TOKENS=0.` }],
+        isError: true,
+      };
+    }
     try {
       switch (toolName) {
         case 'query_response':
@@ -546,6 +562,11 @@ export class MCPProxy {
 
     if (asyncTarget) {
       this.targetStatus = 'connecting';
+      const cached = await this.cacheManager.getTargetInterface();
+      if (cached?.tools?.length) {
+        this.targetTools = cached.tools as Tool[];
+        if (cached.serverInfo) this.targetServerInfo = cached.serverInfo;
+      }
       // Connect our server to stdio immediately so client can use cache tools and target_status
       const transport = new StdioServerTransport();
       await this.server.connect(transport);
@@ -562,6 +583,7 @@ export class MCPProxy {
       this.targetServerInfo = initResult.serverInfo;
       const listResult = await this.targetTransport.sendRequest('tools/list');
       this.targetTools = listResult.tools || [];
+      await this.cacheManager.saveTargetInterface(this.targetTools, this.targetServerInfo);
 
       const transport = new StdioServerTransport();
       await this.server.connect(transport);

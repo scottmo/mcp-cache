@@ -5,7 +5,7 @@
 import { mkdir, writeFile, readFile, readdir, unlink, stat } from 'fs/promises';
 import { join } from 'path';
 import { randomBytes } from 'crypto';
-import { CachedResponse, ResponseMetadata } from './types.js';
+import { CachedResponse, CachedTargetInterface, ResponseMetadata } from './types.js';
 
 /** Stable JSON key for tool args (sorted keys) for cache lookup. */
 export function stableArgsKey(args: Record<string, unknown> | undefined): string {
@@ -71,6 +71,49 @@ export class CacheManager {
 
   private getMetaFilePath(id: string): string {
     return join(this.cacheDir, `${id}.meta.json`);
+  }
+
+  private static sanitizeForFilename(s: string | undefined): string {
+    if (s == null || s === '') return 'unknown';
+    return s.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '') || 'unknown';
+  }
+
+  private getTargetInterfacePath(serverInfo?: CachedTargetInterface['serverInfo']): string {
+    const name = CacheManager.sanitizeForFilename(serverInfo?.name);
+    const version = CacheManager.sanitizeForFilename(serverInfo?.version);
+    return join(this.cacheDir, `${name}_v${version}_target_interface.json`);
+  }
+
+  async saveTargetInterface(
+    tools: CachedTargetInterface['tools'],
+    serverInfo?: CachedTargetInterface['serverInfo']
+  ): Promise<void> {
+    const data: CachedTargetInterface = {
+      tools,
+      serverInfo,
+      savedAt: new Date().toISOString(),
+    };
+    await writeFile(this.getTargetInterfacePath(serverInfo), JSON.stringify(data, null, 2), 'utf8');
+  }
+
+  async getTargetInterface(): Promise<CachedTargetInterface | null> {
+    try {
+      const files = await readdir(this.cacheDir);
+      const interfaceFiles = files.filter(f => f.endsWith('_target_interface.json'));
+      if (interfaceFiles.length === 0) return null;
+      const byMtime = await Promise.all(
+        interfaceFiles.map(async (f) => {
+          const p = join(this.cacheDir, f);
+          const s = await stat(p);
+          return { path: p, mtime: s.mtimeMs };
+        })
+      );
+      byMtime.sort((a, b) => b.mtime - a.mtime);
+      const data = await readFile(byMtime[0].path, 'utf8');
+      return JSON.parse(data) as CachedTargetInterface;
+    } catch {
+      return null;
+    }
   }
 
   async save(tool: string, data: any, client: string, args?: Record<string, unknown>): Promise<string> {
