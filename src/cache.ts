@@ -61,8 +61,9 @@ export class CacheManager {
     }
   }
 
-  private generateId(): string {
-    return 'resp_' + randomBytes(6).toString('hex');
+  private generateId(tool?: string): string {
+    const prefix = CacheManager.sanitizeForFilename(tool) || 'resp';
+    return prefix + '_' + randomBytes(6).toString('hex');
   }
 
   private getFilePath(id: string): string {
@@ -117,7 +118,7 @@ export class CacheManager {
   }
 
   async save(tool: string, data: any, client: string, args?: Record<string, unknown>): Promise<string> {
-    const id = this.generateId();
+    const id = this.generateId(tool);
     const now = new Date();
     const expiresAt = new Date(now.getTime() + this.ttl * 1000);
     const argsKey = args !== undefined ? stableArgsKey(args) : undefined;
